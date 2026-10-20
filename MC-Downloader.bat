@@ -45,6 +45,7 @@ exit /b %MCDL_RC%
 #    MC-Downloader.bat latest bmcl              最新正式版（snapshot = 最新快照）
 #
 #  请把本文件放在 PCL2 的 exe 旁边，否则运行时会让你拖入 PCL2 的位置。
+#  项目主页（更新、反馈）：https://github.com/Maveric0/MC-Downloader
 #  编辑后请保存为 UTF-8（无 BOM）编码。
 # =====================================================================
 
@@ -56,6 +57,7 @@ $UserAgent        = 'MCDL-bat/1.0'
 $OfficialManifest = 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
 $JavaRuntimeIndex = 'https://piston-meta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json'
 $BmclRoot         = 'https://bmclapi2.bangbang93.com'
+$RepoUrl          = 'https://github.com/Maveric0/MC-Downloader'
 
 # 卡住检测：连接在下载中途“速度为 0”超过这个秒数，就断开并立刻换源重试
 $StallSeconds     = 20    # 全程生效（设为 0 = 关闭）
@@ -438,38 +440,73 @@ function ConvertTo-MavenMirror([string]$url) {
 }
 function Get-LibUrls([string]$url) { return , (Join-Sources @($url) @(ConvertTo-MavenMirror $url)) }
 
-function Get-Bytes([string]$url) {
-    $req = [Net.WebRequest]::Create($url)
-    $req.UserAgent = $UserAgent
-    $req.Timeout = 15000
-    $req.ReadWriteTimeout = 30000
-    $req.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate
-    $resp = $req.GetResponse()
-    try {
-        $ms = New-Object IO.MemoryStream
-        $s = $resp.GetResponseStream()
-        try { $s.CopyTo($ms) } finally { $s.Dispose() }
-        return , $ms.ToArray()
-    } finally { $resp.Close() }
+function Get-SourceName([string]$u) {
+    if ($u.StartsWith($BmclRoot, [StringComparison]::OrdinalIgnoreCase)) { return 'BMCLAPI' }
+    try { return ([Uri]$u).Host } catch { return $u }
 }
 
-# 主线程用：下载小文件（清单、JSON、安装器），多源 + 重试 + 可选 SHA1 校验。
+# 主线程下载一个小文件。同步的 GetResponse / Read 一旦卡住，从外面没法打断，
+# 所以改用异步请求、由主线程计时：连接 $connectMs 毫秒没有响应，或者下载中途 $stallMs 毫秒没收到数据，
+# 就 Abort() 掉这个请求并抛出 TimeoutException，由 Get-Remote 立刻换源重启
+function Get-Bytes([string]$url, [int]$connectMs, [int]$stallMs) {
+    $req = [Net.WebRequest]::Create($url)
+    $req.UserAgent = $UserAgent
+    $req.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate
+    $resp = $null
+    try {
+        $task = $req.GetResponseAsync()
+        if (-not $task.Wait($connectMs)) {
+            $req.Abort()
+            throw [TimeoutException]::new('连接 ' + [int]($connectMs / 1000) + ' 秒没有响应')
+        }
+        $resp = $task.Result
+        $s = $resp.GetResponseStream()
+        $ms = [IO.MemoryStream]::new()
+        $buf = [byte[]]::new(65536)
+        while ($true) {
+            $rt = $s.ReadAsync($buf, 0, $buf.Length)
+            if (-not $rt.Wait($stallMs)) {
+                $req.Abort()
+                throw [TimeoutException]::new('下载中途 ' + [int]($stallMs / 1000) + ' 秒没有收到数据')
+            }
+            $n = $rt.Result
+            if ($n -le 0) { break }
+            $ms.Write($buf, 0, $n)
+        }
+        return , $ms.ToArray()
+    } finally {
+        if ($null -ne $resp) { $resp.Close() }
+    }
+}
+
+# 主线程用：下载小文件（版本列表、JSON、安装器），多源 + 卡住即重启 + 可选 SHA1 校验。
+# 各个源轮流试；某次卡住（超时）就立刻断开、不等待，换下一个源重试（BMCLAPI 重试时会被分到别的节点）。
+# 每一轮的时限放宽一些，避免网速本来就慢时被误判为卡住。
 # 所有源都回答“没有这个文件”（HTTP 400/404/410）时抛出 FileNotFoundException，方便调用方判断“不支持”
 function Get-Remote([string[]]$urls, [string]$what, [string]$sha1) {
+    $list = @($urls | Where-Object { $_ } | Select-Object -Unique)
+    $connectLimits = 8000, 12000, 20000   # 每一轮：连接多久没响应算卡住（毫秒）
+    $stallLimits = 6000, 10000, 15000     # 每一轮：下载中途多久没数据算卡住（毫秒）
     $last = ''
     $dead = [System.Collections.Generic.HashSet[string]]::new()
-    $distinct = @($urls | Select-Object -Unique).Count
-    for ($round = 0; $round -lt 3; $round++) {
-        foreach ($u in $urls) {
+    for ($round = 0; $round -lt $connectLimits.Count; $round++) {
+        foreach ($u in $list) {
             if ($dead.Contains($u)) { continue }
             try {
-                $data = Get-Bytes $u
-                if (-not $sha1 -or (Get-Sha1Hex $data) -eq $sha1.ToLowerInvariant()) { return , $data }
+                $data = Get-Bytes $u $connectLimits[$round] $stallLimits[$round]
+                if (-not $sha1 -or (Get-Sha1Hex $data) -eq $sha1.ToLowerInvariant()) {
+                    $global:McdlRemoteFrom = $u
+                    return , $data
+                }
                 $last = "SHA1 校验失败（$($u)）"
             } catch {
                 $e = $_.Exception
                 while ($e.InnerException) { $e = $e.InnerException }
                 $last = "$($e.Message)（$($u)）"
+                if ($e -is [TimeoutException]) {
+                    Write-Host "    $(Get-SourceName $u) $($e.Message)，已断开，换源重试..." -ForegroundColor DarkGray
+                    continue
+                }
                 # 服务器明确说没有这个文件：换源可以，原地重试没有意义
                 if ($e -is [Net.WebException] -and $e.Response -is [Net.HttpWebResponse]) {
                     $code = [int]$e.Response.StatusCode
@@ -480,11 +517,11 @@ function Get-Remote([string[]]$urls, [string]$what, [string]$sha1) {
                     }
                 }
             }
-            Start-Sleep -Milliseconds (500 + 1000 * $round)
+            Start-Sleep -Milliseconds (300 + 700 * $round)
         }
-        if ($dead.Count -ge $distinct) { break }
+        if ($dead.Count -ge $list.Count) { break }
     }
-    if ($dead.Count -ge $distinct) { throw [IO.FileNotFoundException]::new("下载$($what)失败：服务器上没有这个文件（$($last)）") }
+    if ($list.Count -gt 0 -and $dead.Count -ge $list.Count) { throw [IO.FileNotFoundException]::new("下载$($what)失败：服务器上没有这个文件（$($last)）") }
     throw "下载$($what)失败：$($last)"
 }
 
@@ -1589,6 +1626,7 @@ try {
     Write-Host '  ======================================================' -ForegroundColor DarkCyan
     Write-Host '     Minecraft 下载器   原版 / Fabric / Forge / NeoForge' -ForegroundColor DarkCyan
     Write-Host '                        Modrinth 整合包（.mrpack）' -ForegroundColor DarkCyan
+    Write-Host "     项目主页：$($RepoUrl)" -ForegroundColor DarkGray
     Write-Host '  ======================================================' -ForegroundColor DarkCyan
     Write-Host ''
 
@@ -1711,13 +1749,15 @@ try {
     # ---- 版本列表 ----
     Write-Host ''
     Write-Info '正在获取版本列表...'
+    $swList = [Diagnostics.Stopwatch]::StartNew()
     $manifest = ConvertFrom-JsonText ([Text.Encoding]::UTF8.GetString((Get-Remote (Get-Urls $OfficialManifest) '版本列表' $null)))
+    $listFrom = Get-SourceName ([string]$global:McdlRemoteFrom)
     $versions = J $manifest 'versions'
     $latestRelease = J $manifest 'latest' 'release'
     $latestSnapshot = J $manifest 'latest' 'snapshot'
     $vmap = @{}
     foreach ($v in $versions) { $vmap[[string](J $v 'id')] = $v }
-    Write-Host "  最新正式版：$($latestRelease)    最新快照：$($latestSnapshot)"
+    Write-Host ('  最新正式版：{0}    最新快照：{1}    （来自 {2}，用时 {3:N1} 秒）' -f $latestRelease, $latestSnapshot, $listFrom, $swList.Elapsed.TotalSeconds)
 
     # ---- 选择 Minecraft 版本（装加载器时顺便确认这个版本有对应的加载器） ----
     $VersionId = $null
