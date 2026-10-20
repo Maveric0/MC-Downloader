@@ -1,0 +1,3 @@
+# .bat 原样保存 CRLF 换行（不让 git 转换），否则从 GitHub 直接下载的文件可能无法运行
+*.bat -text
+*.md text eol=lf
